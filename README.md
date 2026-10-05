@@ -12,6 +12,8 @@
 **整网导入、隔离提交、复供确认、水源切换**每次实际改变状态时，在**同一事务**内冻结一条
 不可复用编号的**操作后状态快照**，并在同一事务内接入连续的 **SHA-256 摘要链**
 （首条使用固定创世摘要；首次启用时为现存快照补建链并标明建链起点）；
+高频小操作的快照只持久化相对上一条快照的**净变化**（增量存储，读取时透明还原，
+摘要仍按完整状态计算），新增持久化量不随未变化的管网规模线性增长；
 供调度员按操作顺序回看当时的节点、水源运行状态、
 管段阀位、待修复故障与由运行水源可达的用水点，支持相邻快照六类净变化对照，
 调度审计员还可凭事先保存的起点前、终点摘要**只读核验**任意区间，定位首个
@@ -41,7 +43,7 @@
 > 写入后的完整视图，绝不拼接不同提交时刻的阀位、水源与事件。确认类写操作
 > （提交/确认）仍按各自契约**锁定最新状态原子复核**，过期版本沿用 `409`；
 > 复供事件不存在 / 已复供仍分别返回 `404 EVENT_NOT_FOUND` /
-> `409 EVENT_ALREADY_RESTORED`。详见第 17 节。
+> `409 EVENT_ALREADY_RESTORED`。详见第 18 节。
 
 > 全部通水计算（读网、关阀建议、隔离预演/提交、复供预演/确认、水源切换预演、
 > 流量核算、分档交付、调度演练、临时旁通评估）只以**运行中**的水源为供水起点；停运水源不再供水。
@@ -88,6 +90,8 @@ docker compose down -v       # 同时清空数据库数据卷
 | `DB_CONNECT_RETRIES` | `30` | 启动时等待数据库就绪的重试次数 |
 | `DB_CONNECT_RETRY_INTERVAL` | `1.0` | 重试间隔秒数 |
 | `HISTORY_LIMIT` | `100` | 历史记录接口返回上限 |
+| `SNAPSHOT_DELTA_MAX_DEPTH` | `32` | 快照增量存储：距最近全量快照的最大增量跳数（超过则本条改存全量；`0` 表示关闭增量存储） |
+| `SNAPSHOT_DELTA_FULL_RATIO` | `0.6` | 增量载荷达到全量状态该比例时直接存全量（变化面过大增量不省空间） |
 
 ### 本地（非 Docker）运行
 
@@ -348,6 +352,13 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 - **旧库上线**只在快照表为空且当前存在管网时，以**当下状态**建立一条
   `baseline` 基线快照（记录当前版本与当前待修复故障），**不伪造**早期操作记录；
   空库与已有快照的库不产生基线，建基线本身幂等；
+- **增量存储（持久化形式，对读取透明）**：小范围变更的快照只写相对上一条
+  现存快照的净变化（`state_format='delta'` + 一行 `state_snapshot_deltas`，
+  与快照行、摘要链行同事务提交、同事务回滚），未变化的节点/管段不再重复
+  落盘；整网导入、旧库基线、全库首条、增量链过深
+  （`SNAPSHOT_DELTA_MAX_DEPTH`）或变化面过大（`SNAPSHOT_DELTA_FULL_RATIO`）
+  时仍存全量。读取、对照与审计核验先把增量沿基线链还原为完整冻结状态，
+  对外字段与口径不变；历史全量快照与新写增量记录共存，互不重写；
 - 相邻快照对照输出六类**净变化**：节点新增/移除、管段新增/移除、
   共有管段阀位开/关变化、共有水源运行状态变化、待修复故障新增/移除（按事件编号）、
   可达用水点新增/移除；首条快照无更早基线时，其状态全部计为新增；
@@ -357,12 +368,13 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 **快照摘要链（调度审计，事后改写核验）**（只增不改、随状态变更同事务接链）：
 
 - 每条快照在**原状态变更事务内**附带一条 SHA-256 摘要，整网导入即使版本重置
-  为 `1` 也**不断链**（快照编号继续单调递增）；快照行与摘要链行同事务写入，
-  事务回滚二者同时回滚，链上不存在半完成记录；
+  为 `1` 也**不断链**（快照编号继续单调递增）；快照行、增量行（若有）与
+  摘要链行同事务写入，事务回滚三者同时回滚，链上不存在半完成记录；
 - 摘要以**固定可复现编码** `canonical_json`（键升序、紧凑分隔、UTF-8）覆盖：
   快照编号、操作类型、管网版本、关联事件、创建时间（统一规范化为
   UTC `…Z`，与数据库时区无关）、**完整冻结状态**、前一条摘要；信封还固定带
-  `"chain":"water-snapshot-chain/v1"` 版本标识；
+  `"chain":"water-snapshot-chain/v1"` 版本标识；增量存储的快照同样按
+  **还原后的完整状态**计算与重算，摘要值与全量存储时逐字节一致；
 - 链按**实际存在**的快照编号顺序连续：每条链接“编号严格小于自身的最近一条
   现存快照”。**回滚造成的 BIGSERIAL 编号空洞自动跳过、不算断链**；
 - **首条入链快照使用固定创世摘要**
@@ -1065,7 +1077,97 @@ python3 examples/audit_chain_demo.py http://localhost:8000
 内容损坏/链路断裂需直接改写数据库才能复现（正常 API 没有任何改写快照的路径），
 其定位逻辑由 `tests/test_audit.py` 覆盖。
 
-### 12. 用水点最低流量核算（只读）
+### 12. 快照增量存储与回看（本轮存储格式）
+
+调度频繁切换水源、隔离和复供时，每次操作只改变少量阀位 / 水源运行状态 /
+待修复故障，但此前每条快照都把**全网**完整状态写入 `state_snapshots.state`，
+新增持久化量随未变化的管网规模线性增长。自本轮起，**小范围变更的快照只
+持久化相对上一条现存快照的净变化**（增量存储），读取时透明还原为完整状态；
+调度结果、快照编号、摘要链与全部 HTTP 接口及错误语义均不变。
+
+**存储格式**（两张表，与业务变更、摘要链同事务写入、同事务回滚）：
+
+- `state_snapshots` 新增 `state_format` 列（`'full'` / `'delta'`，默认 `'full'`）：
+  - `full`：`state` 为完整冻结状态——**历史全部快照**、整网导入、旧库基线、
+    全库首条、增量链过深或变化面过大的快照；
+  - `delta`：`state` 为 `NULL`，完整状态由增量行还原；
+- `state_snapshot_deltas`（新增表，仅 `delta` 快照有行）：
+  `snapshot_id`（主键，引用快照）、`base_snapshot_id`（**编号严格小于自身的
+  最近一条现存快照**，与摘要链前驱同一条）、`depth`（距最近全量快照的增量
+  跳数，全量视为 0）、`delta`（增量载荷 JSONB）。
+
+增量载荷为确定性 JSON（`app/snapshot_delta.py`，格式标识
+`water-snapshot-delta/v1`）：节点 / 管段 / 待修复故障按标识（`id` /
+`event_id`）记 `upsert`（新增或变化的完整对象）与 `remove`（消失的标识），
+可达用水点记集合净变化 `add` / `remove`；**未变化的实体不产生任何字节**，
+因此小范围操作的新增持久化量只随本次变化大小增长。例如关一个阀门只产生：
+
+```json
+{
+  "format": "water-snapshot-delta/v1",
+  "nodes": {"upsert": [], "remove": []},
+  "pipes": {"upsert": [{"id": "P4", "from": "B", "to": "D", "has_valve": true, "valve_closed": true, "name": null}], "remove": []},
+  "open_faults": {"upsert": [{"event_id": 1, "fault_pipe_id": "P6"}], "remove": []},
+  "supplied_sink_ids": {"add": [], "remove": ["U3"]}
+}
+```
+
+**何时仍存全量**（保证读取回溯有界、整网重导后旧快照独立可还原）：
+整网导入与旧库基线（天然检查点）、全库首条、距最近全量快照的增量跳数
+超过 `SNAPSHOT_DELTA_MAX_DEPTH`（默认 32）、或增量载荷达到全量状态的
+`SNAPSHOT_DELTA_FULL_RATIO`（默认 0.6）时，本条直接存全量并把链深归零。
+
+**摘要与链不变**：无论全量还是增量存储，每条快照的 SHA-256 摘要仍按
+**还原后的完整冻结状态**以同一 `canonical_json` 口径计算（增量还原结果与
+`freeze_state` 输出逐字节一致），前驱关系、创世摘要、建链起点语义不变；
+历史摘要绝不重算重写。读取接口（按编号读取、相邻对照、审计区间核验）先
+沿 `base_snapshot_id` 链回溯到最近全量快照再正向套用增量，对外只暴露
+完整状态。
+
+**兼容与升级**：启动 DDL 幂等迁移既有库——补 `state_format` 列（既有记录
+一律为 `full`）、放开 `state` 的 `NOT NULL`、建增量表与约束；历史全量快照
+与新写增量记录自然共存，整网重导不截断快照表，旧快照仍可查询。
+
+**回看方式调用示例**（HTTP 与既有版本完全一致）：
+
+```bash
+# 高频小操作：每次只写一行增量（快照编号照常递增、摘要照常接链）
+curl -s -X POST http://localhost:8000/api/network/import -H 'Content-Type: application/json' -d @examples/sample_network.json
+curl -s -X POST http://localhost:8000/api/isolation/submit -H 'Content-Type: application/json' -d '{"fault_pipe_id":"P6","close_pipe_ids":["P4"],"version":1}'
+curl -s -X POST http://localhost:8000/api/isolation/events/1/restore -H 'Content-Type: application/json' -d '{"version":2}'
+curl -s -X POST http://localhost:8000/api/sources/switch -H 'Content-Type: application/json' -d '{"targets":[{"source_id":"S","running":false}],"version":3}'
+
+# 按编号读取：增量存储的快照仍返回操作当时的完整状态（字段不变）
+curl -s http://localhost:8000/api/snapshots/2
+# 相邻对照：六类净变化口径不变
+curl -s http://localhost:8000/api/snapshots/3/diff
+# 审计区间核验：仍按完整状态逐条重算（边界摘要用法见第 11 节）
+curl -s -X POST http://localhost:8000/api/audit/verify -H 'Content-Type: application/json' \
+  -d '{"start_id":1,"end_id":4,"pre_start_digest":"<起点前摘要>","end_digest":"<终点摘要>"}'
+```
+
+存储格式可直接用 SQL 查验（只读）：
+
+```sql
+-- 各快照的存储形式与落盘体量：full 为全量、delta 为增量（state 为 NULL）
+SELECT id, op_type, state_format, pg_column_size(state) AS state_bytes
+FROM   state_snapshots ORDER BY id;
+
+-- 增量行：相对上一条现存快照的净变化与链深
+SELECT snapshot_id, base_snapshot_id, depth, jsonb_pretty(delta) AS delta
+FROM   state_snapshot_deltas ORDER BY snapshot_id;
+```
+
+全流程演示脚本（标准库实现）：导入 → 隔离 / 复供 / 水源切换等高频小操作 →
+按编号读取 → 相邻对照 → 摘要链区间核验 → 整网重导后旧快照仍按当时状态还原：
+
+```bash
+python3 examples/snapshot_delta_demo.py
+# 或指定地址：
+python3 examples/snapshot_delta_demo.py http://localhost:8000
+```
+
+### 13. 用水点最低流量核算（只读）
 
 调度员在**现有阀位与故障状态**下，携带已读版本、每个水源的供水上限、每条管段的
 双向共用输水上限与本次申报需求的用水点，核算最大可交付总量（**只读**，不改任何状态）：
@@ -1141,7 +1243,7 @@ python3 examples/delivery_demo.py http://localhost:8000
 水源上限不足 → 隔离关阀后故障片区断供 / 只申报可达用水点即可满足 →
 编号未覆盖/重复/类型错误的 422 拒绝 → 确认版本、阀位与事件全程未被改写。
 
-### 13. 保障等级分档交付（只读，供水不足时按等级核算）
+### 14. 保障等级分档交付（只读，供水不足时按等级核算）
 
 调度员在**现有阀位与故障状态**下，携带已读版本、覆盖全部水源/管段的非负整数
 容量，以及**非空**用水点需求（每点给非负整数需求 `demand` 与正整数保障等级
@@ -1225,7 +1327,7 @@ python3 examples/allocate_demo.py http://localhost:8000
 隔离关阀后故障片区断供 → 等级非正整数 / 编号未覆盖 / 重复 / 类型错误的 422 拒绝 →
 确认版本、阀位与事件全程未被改写。
 
-### 14. 管段流量计读数核对（只读，缺报推断）
+### 15. 管段流量计读数核对（只读，缺报推断）
 
 调度员携带已读版本、每个水源的**实际注入量**、每个用水点的**实际取用量**、
 覆盖全部管段的**双向共用容量**与可为空的**带符号读数**（`from→to` 为正，升/小时），
@@ -1310,7 +1412,7 @@ python3 examples/meter_reconcile_demo.py http://localhost:8000
 编号未覆盖/重复/未知节点与类型错误的 422 拒绝 → 确认版本、阀位、水源状态与事件
 全程未被改写。
 
-### 15. 调度演练（只读：一串操作执行前的逐步预检）
+### 16. 调度演练（只读：一串操作执行前的逐步预检）
 
 调度员把一串**有序的隔离、复供、水源切换操作**连同已读版本一起提交演练；
 服务以当前状态为起点逐步套用既有提交校验，**全程只读**（不改版本、阀位、
@@ -1401,7 +1503,7 @@ python3 examples/drill_demo.py http://localhost:8000
 过期版本 409 → 引用不存在事件 EVENT_NOT_FOUND → 再次确认只读，
 并按既有接口真实复供（单步契约不变）。
 
-### 16. 临时旁通管评估（只读：抢修期间评估旁通供水效果）
+### 17. 临时旁通管评估（只读：抢修期间评估旁通供水效果）
 
 抢修期间，调度员携带已读版本、两个现有节点（旁通端点）、旁通管双向共用容量、
 覆盖全部水源/管段的容量与带保障等级的用水需求，评估一条临时旁通管的供水效果
@@ -1569,7 +1671,7 @@ python3 examples/bypass_demo.py http://localhost:8000
 端点不存在/相同、编号未覆盖、容量非法的 422 拒绝 →
 确认版本、阀位、事件与管网全程未被改写。
 
-### 17. 只读接口的同一已提交状态保证（一致性快照）
+### 18. 只读接口的同一已提交状态保证（一致性快照）
 
 **问题背景**：只读接口需要从多个表分次取数（`network_meta` 的版本、`nodes`、
 `pipes`、`isolation_events` 的待修复事件）。在默认的 READ COMMITTED 下，每条
@@ -1696,12 +1798,18 @@ python3 examples/consistent_read_demo.py http://localhost:8000
 
 ## 七、测试
 
-核心图算法与校验逻辑（`tests/test_planning.py`，114 个用例）与快照摘要链
+核心图算法与校验逻辑（`tests/test_planning.py`，114 个用例）、快照摘要链
 （`tests/test_audit.py`，18 个用例：固定编码/时区无关/逐条重算/损坏与断链定位/
-仅边界不符/编号空洞/摘要格式）均不依赖数据库与第三方库，可直接用标准库运行：
+仅边界不符/编号空洞/摘要格式）与快照增量存储
+（`tests/test_snapshot_delta.py`，14 个用例：增量计算/套用往返逐字节一致、
+摘要按还原状态复现、小变更增量不随管网规模增长、全量回退策略；
+`tests/test_snapshot_delta_db.py`，12 个用例：以 psycopg2 内存桩覆盖
+写入决策——首条全量直连创世摘要、小变更写增量、整网导入强制全量并重置链深、
+链深/体积比例回退全量、缺链 fail-closed，读取透明还原与补建链、区间核验）
+均不依赖数据库与第三方库，可直接用标准库运行：
 
 ```bash
-python3 -m unittest tests.test_planning tests.test_audit -v
+python3 -m unittest tests.test_planning tests.test_audit tests.test_snapshot_delta tests.test_snapshot_delta_db -v
 ```
 
 路由层集成测试（`tests/test_api.py`）用内存替身替换数据库，覆盖完整 HTTP 契约（含关阀建议、复供预演/确认、水源停运/恢复预演与确认、流量只读核算、**保障等级分档交付（等级总量/逐点字典序/阻断口径/422/只读）**、读数核对（一致性/缺报范围/硬约束/422）、**调度演练（逐步预检/临时事件引用/首败即停/409/只读）**、**临时旁通管评估（基线对照/重新进水判不可用/并联/422/只读）**、版本与安全拒绝、整网替换失效、状态快照冻结/读取/相邻对照/失败不留痕/重导不覆盖、**摘要链同事务接链/区间核验 ok·边界不符·内容损坏·链断定位/编号空洞不断链/倒序与缺端点 4xx/只读**、**只读一致性快照（关阀建议/隔离·复供·水源切换预演/流量核算/旁通/读数核对/调度演练在并发提交下只返回写入前或写入后的完整视图）**、**复供并发（两个同版安全确认恰好 1×200+1×409 且版本/阀位/快照各只有一份、与整网重导交错只串行不死锁、锁内按最终状态复核 409/422）**）；`tests/test_db_readonly.py` 用 mock 连接校验只读快照事务的连接级语义（`REPEATABLE READ READ ONLY`、回滚释放、异常安全）。需先安装依赖：
@@ -1727,7 +1835,8 @@ app/
   schemas.py      # Pydantic 请求/响应模型
   planning.py     # 纯领域逻辑：导入校验、无向图可达性(BFS，仅运行水源)、隔离评估、复供安全评估、关阀建议、水源切换评估、流量核算(校验+整数无向最大流)、保障等级分档交付(有下界整数环流+残量环流补偿的字典序最大流)、临时旁通管评估(内存接入旁通的基线/交付对照与重新进水判定)、读数核对(校验+整数有界可行流+缺报流量范围)、调度演练(状态副本上逐步套用提交校验的只读推演)、状态快照冻结与相邻对照
   audit.py        # 快照 SHA-256 摘要链：固定可复现编码、创世摘要、只读区间核验(内容损坏/链路断裂/边界不符定位)
-  db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、只读一致性快照事务(REPEATABLE READ READ ONLY)、状态快照写入/同事务接链、首次启用补建链与起点元数据、旧库上线基线、审计区间只读查询、历史
+  snapshot_delta.py # 快照增量存储：净变化计算/套用(还原结果与 freeze_state 逐字节一致)、全量回退策略(纯函数)
+  db.py           # PostgreSQL：DDL/迁移、快照、整网导入、事务化隔离提交、事务化复供、事务化水源切换、只读一致性快照事务(REPEATABLE READ READ ONLY)、状态快照写入/同事务接链(小范围变更只写增量、读取透明还原)、首次启用补建链与起点元数据、旧库上线基线、审计区间只读查询、历史
   serializers.py  # 响应序列化
   main.py         # FastAPI 路由与错误处理
 examples/
@@ -1746,10 +1855,13 @@ examples/
   bypass_demo.py          # 临时旁通管评估全流程示例（只读：基线/旁通交付对照与差值、重新进水判不可用、并联、422）
   consistent_read_demo.py # 只读一致性快照示例（并发隔离/复供写入下，逐响应校验版本与交付量同一时刻、无跨提交拼接）
   snapshot_demo.py        # 状态快照回看全流程示例（四类操作冻结/读取/对照/不留痕/重导不覆盖）
+  snapshot_delta_demo.py  # 快照增量存储与回看示例（高频小操作只写增量、读取/对照/审计还原完整状态、重导后旧快照可查）
   audit_chain_demo.py     # 快照摘要链核验示例（只读：链信息/区间核验/边界不符/缺端点/倒序/摘要格式）
 tests/
   test_planning.py
   test_audit.py
+  test_snapshot_delta.py  # 快照增量计算/套用与全量回退策略（纯算法，无需数据库）
+  test_snapshot_delta_db.py # 增量存储数据访问层（psycopg2 内存桩：写入决策/透明还原/补建链）
   test_api.py
   test_restore_concurrency_pg.py # 真实 PostgreSQL 复供并发/统一锁序回归（默认跳过，RUN_DB_TESTS=1 开启）
   test_db_readonly.py   # 只读快照事务的连接级语义（mock psycopg2，无需真实数据库）

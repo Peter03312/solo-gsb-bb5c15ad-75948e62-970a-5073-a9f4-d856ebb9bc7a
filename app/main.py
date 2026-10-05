@@ -126,7 +126,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="供水管网故障隔离服务",
-    version="1.5.1",
+    version="1.6.0",
     lifespan=lifespan,
 )
 
