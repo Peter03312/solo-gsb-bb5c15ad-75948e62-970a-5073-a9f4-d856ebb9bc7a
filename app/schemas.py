@@ -680,6 +680,25 @@ class SnapshotMetaOut(BaseModel):
     created_at: datetime
 
 
+class SnapshotStorageOut(BaseModel):
+    """快照的存储形态与持久化量（只读；不影响快照读取/对照/核验的既有语义）。
+
+    storage=full：整网导入、旧库基线、全库首条或增量不更省时的全量快照；
+    storage=delta：小范围变更的增量快照，只持久化相对 base_snapshot_id
+    的净变化（格式 water-snapshot-delta/v1），读取时还原完整状态。
+    state_bytes 为还原后完整冻结状态的字节数，stored_bytes 为该条快照
+    实际新增的持久化字节数（full 时二者相等）。
+    """
+
+    id: int
+    op_type: str
+    storage: str
+    base_snapshot_id: int | None = None
+    state_bytes: int
+    stored_bytes: int
+    created_at: datetime
+
+
 class SnapshotNodeChangeOut(BaseModel):
     id: str
     type: NodeType

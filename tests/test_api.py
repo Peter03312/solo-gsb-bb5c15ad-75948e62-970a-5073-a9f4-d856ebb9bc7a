@@ -381,6 +381,23 @@ def fake_get_previous_state_snapshot(conn, snapshot_id):
     return copy.deepcopy(previous[-1]) if previous else None
 
 
+def fake_get_snapshot_storage(conn, snapshot_id):
+    # 内存替身恒为全量存储（full）：stored_bytes == state_bytes
+    for s in _snapshots_view():
+        if s["id"] == snapshot_id:
+            size = len(audit.canonical_json(s["state"]).encode("utf-8"))
+            return {
+                "id": s["id"],
+                "op_type": s["op_type"],
+                "storage": "full",
+                "base_snapshot_id": None,
+                "state_bytes": size,
+                "stored_bytes": size,
+                "created_at": s["created_at"],
+            }
+    return None
+
+
 # ---- 快照摘要链（审计）替身 ----
 
 
@@ -437,6 +454,7 @@ db.insert_state_snapshot = fake_insert_state_snapshot
 db.get_state_snapshot = fake_get_state_snapshot
 db.list_state_snapshots = fake_list_state_snapshots
 db.get_previous_state_snapshot = fake_get_previous_state_snapshot
+db.get_snapshot_storage = fake_get_snapshot_storage
 db.state_snapshot_exists = fake_state_snapshot_exists
 db.list_snapshot_chain_rows = fake_list_snapshot_chain_rows
 db.get_chain_info = fake_get_chain_info
@@ -1611,6 +1629,30 @@ class ApiTests(unittest.TestCase):
         r = self.client.get("/api/snapshots/999/diff")
         self.assertEqual(r.status_code, 404)
         self.assertEqual(r.json()["error"]["code"], "SNAPSHOT_NOT_FOUND")
+
+    def test_snapshot_storage_endpoint_reports_form_and_bytes(self):
+        self._import()  # 快照 1（内存替身恒为全量存储）
+        r = self.client.get("/api/snapshots/1/storage")
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["id"], 1)
+        self.assertEqual(body["op_type"], "network_import")
+        self.assertEqual(body["storage"], "full")
+        self.assertIsNone(body["base_snapshot_id"])
+        self.assertGreater(body["state_bytes"], 0)
+        self.assertEqual(body["stored_bytes"], body["state_bytes"])
+
+    def test_snapshot_storage_not_found_is_explicit_error(self):
+        r = self.client.get("/api/snapshots/999/storage")
+        self.assertEqual(r.status_code, 404)
+        self.assertEqual(r.json()["error"]["code"], "SNAPSHOT_NOT_FOUND")
+
+    def test_snapshot_storage_readonly_does_not_change_state(self):
+        self._import()
+        self.client.get("/api/snapshots/1/storage")
+        # 只读：不产生新版本/新快照
+        self.assertEqual(STORE.version, 1)
+        self.assertEqual([s["id"] for s in STORE.snapshots], [1])
 
     def test_snapshot_list_order_limit_cursor(self):
         self._import()  # 快照 1

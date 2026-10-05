@@ -1,4 +1,11 @@
-"""PostgreSQL 访问层：建表、当前快照读取、整网导入、隔离提交、复供、水源切换、状态回看快照。"""
+"""PostgreSQL 访问层：建表、当前快照读取、整网导入、隔离提交、复供、水源切换、状态回看快照。
+
+状态快照采用**全量 + 增量（delta）混合存储**：整网导入与旧库基线写全量
+快照；隔离提交、复供确认、水源切换等小范围变更只持久化相对上一条现存
+快照的净变化（增量行引用其基准快照编号）。读取时沿基准链回溯还原完整
+冻结状态，对外字段与全量快照完全一致；摘要链始终按还原后的完整状态计算，
+与存储形态无关。
+"""
 from __future__ import annotations
 
 import json
@@ -23,7 +30,9 @@ from .planning import (
     OP_NETWORK_IMPORT,
     OP_RESTORE_CONFIRM,
     OP_SOURCE_SWITCH,
+    apply_snapshot_state_delta,
     freeze_state,
+    snapshot_state_delta,
 )
 
 DDL = """
@@ -101,12 +110,42 @@ CREATE TABLE IF NOT EXISTS state_snapshots (
                      'restore_confirm', 'source_switch', 'baseline')),
     network_version INTEGER NOT NULL,
     event_id     BIGINT,
-    state        JSONB NOT NULL,
+    state        JSONB,
     created_at   TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+-- 增量（delta）快照存储：小范围状态变更只持久化相对上一条现存快照的净变化，
+-- 新增持久化量随变化量增长，不随未变化的管网规模线性增长。
+-- 全量行：state 非空、delta/base_snapshot_id 为空（历史快照即此形态，原样保留）；
+-- 增量行：state 为空，base_snapshot_id 指向其增量所对照的上一条现存快照，
+--         delta 为净变化载荷（格式 water-snapshot-delta/v1）。
+-- 两种形态可任意共存；读取时沿 base_snapshot_id 回溯还原完整冻结状态。
+ALTER TABLE state_snapshots
+    ALTER COLUMN state DROP NOT NULL;
+ALTER TABLE state_snapshots
+    ADD COLUMN IF NOT EXISTS base_snapshot_id BIGINT
+        REFERENCES state_snapshots (id);
+ALTER TABLE state_snapshots
+    ADD COLUMN IF NOT EXISTS delta JSONB;
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'state_snapshots_storage_check'
+    ) THEN
+        ALTER TABLE state_snapshots
+            ADD CONSTRAINT state_snapshots_storage_check
+            CHECK (
+                (state IS NOT NULL AND delta IS NULL AND base_snapshot_id IS NULL)
+                OR (state IS NULL AND delta IS NOT NULL AND base_snapshot_id IS NOT NULL)
+            );
+    END IF;
+END$$;
+
 CREATE INDEX IF NOT EXISTS idx_state_snapshots_version
     ON state_snapshots (network_version);
+
+CREATE INDEX IF NOT EXISTS idx_state_snapshots_base
+    ON state_snapshots (base_snapshot_id);
 
 -- 快照摘要链：与 state_snapshots 一一对应，只增不改。
 -- digest/prev_digest 为 64 位十六进制 SHA-256；每条快照在原状态变更事务内接链。
@@ -135,6 +174,14 @@ CREATE TABLE IF NOT EXISTS state_snapshot_chain_meta (
 # 事务级咨询锁：所有接链写入先取此锁，配合各写事务已持有的 network_meta
 # 行锁，保证并发写入下“上一条现存快照”的读取—接链串行化，绝不形成分叉。
 CHAIN_LOCK_KEY = 741289001
+
+# 增量快照：连续增量链的长度上限。超过即重写一条全量快照，
+# 把单次读取需要回溯的行数限制在上限之内（增量行本身只占 O(变化量) 空间）。
+SNAPSHOT_DELTA_MAX_DEPTH = 32
+
+# 这些操作永远写全量快照：整网导入重新定义全部管网状态（也是重导后的新锚点），
+# 旧库基线没有可对照的前身。
+_ALWAYS_FULL_OPS = frozenset({OP_NETWORK_IMPORT, OP_BASELINE})
 
 # 事件状态：待修复 / 已复供
 EVENT_OPEN = "open"
@@ -603,7 +650,10 @@ def list_events(conn, limit: int) -> list[dict]:
 # ---------------------------------------------------------------- 状态快照
 
 
-_SNAPSHOT_COLUMNS = "id, op_type, network_version, event_id, state, created_at"
+_SNAPSHOT_COLUMNS = (
+    "id, op_type, network_version, event_id, state, "
+    "base_snapshot_id, delta, created_at"
+)
 
 
 def _serialize_snapshot_row(row: dict) -> dict:
@@ -615,6 +665,95 @@ def _serialize_snapshot_row(row: dict) -> dict:
         "state": _decode_jsonb(row["state"]),
         "created_at": row["created_at"],
     }
+
+
+def _canonical_size(value) -> int:
+    """固定编码下的字节数：用于全量/增量载荷的持久化量对比。"""
+    return len(audit.canonical_json(value).encode("utf-8"))
+
+
+def _fetch_storage_row(conn, snapshot_id: int) -> dict | None:
+    """读取快照行的存储形态列（state / base_snapshot_id / delta）。"""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            "SELECT id, state, base_snapshot_id, delta "
+            "FROM state_snapshots WHERE id = %s",
+            (snapshot_id,),
+        )
+        return cur.fetchone()
+
+
+def _resolve_state_and_depth(conn, row: dict) -> tuple[dict, int]:
+    """还原一行的完整冻结状态，并返回其连续增量深度（全量行为 0）。
+
+    沿 base_snapshot_id 逐行回溯到最近的全量快照，再正向套用增量载荷；
+    结果与 freeze_state 直接冻结的载荷逐字节等价。写入侧保证连续增量
+    深度不超过 SNAPSHOT_DELTA_MAX_DEPTH，回溯超出该上限即数据被外部
+    破坏（成环/悬空），fail-closed 报错。
+    """
+    chain: list[dict] = []
+    current = row
+    while current["state"] is None:
+        chain.append(current)
+        if len(chain) > SNAPSHOT_DELTA_MAX_DEPTH:
+            raise RuntimeError(
+                f"增量快照链深度异常：从快照 {row['id']} 回溯超过 "
+                f"{SNAPSHOT_DELTA_MAX_DEPTH} 层仍未到达全量快照"
+            )
+        base_id = current["base_snapshot_id"]
+        current = _fetch_storage_row(conn, base_id)
+        if current is None:  # 基准快照被外部破坏：fail-closed，绝不静默拼接
+            raise RuntimeError(
+                f"增量快照 {chain[-1]['id']} 的基准快照 {base_id} 不存在"
+            )
+    state = _decode_jsonb(current["state"])
+    for delta_row in reversed(chain):
+        state = apply_snapshot_state_delta(state, _decode_jsonb(delta_row["delta"]))
+    return state, len(chain)
+
+
+def _resolve_row_state(conn, row: dict, cache: dict[int, dict],
+                       by_id: dict[int, dict] | None = None) -> dict:
+    """还原一行的完整冻结状态（带跨行缓存；by_id 可复用同批已取出的行）。"""
+    if row["state"] is not None:
+        return _decode_jsonb(row["state"])
+    cached = cache.get(row["id"])
+    if cached is not None:
+        return cached
+    chain: list[dict] = []
+    current = row
+    while current["state"] is None:
+        if current["id"] in cache:
+            state = cache[current["id"]]
+            break
+        chain.append(current)
+        if len(chain) > SNAPSHOT_DELTA_MAX_DEPTH:
+            raise RuntimeError(
+                f"增量快照链深度异常：从快照 {row['id']} 回溯超过 "
+                f"{SNAPSHOT_DELTA_MAX_DEPTH} 层仍未到达全量快照"
+            )
+        base_id = current["base_snapshot_id"]
+        current = (by_id or {}).get(base_id) or _fetch_storage_row(conn, base_id)
+        if current is None:
+            raise RuntimeError(
+                f"增量快照 {chain[-1]['id']} 的基准快照 {base_id} 不存在"
+            )
+    else:
+        state = _decode_jsonb(current["state"])
+    for delta_row in reversed(chain):
+        state = apply_snapshot_state_delta(state, _decode_jsonb(delta_row["delta"]))
+        cache[delta_row["id"]] = state
+    return state
+
+
+def _resolve_rows(conn, rows: list[dict]) -> list[dict]:
+    """就地把 rows 中增量行的 state 还原为完整冻结状态（全量行原样）。"""
+    by_id = {row["id"]: row for row in rows}
+    cache: dict[int, dict] = {}
+    for row in rows:
+        if row["state"] is None:
+            row["state"] = _resolve_row_state(conn, row, cache, by_id)
+    return rows
 
 
 def insert_state_snapshot(
@@ -633,46 +772,84 @@ def insert_state_snapshot(
     摘要链行在同一事务内写入，事务回滚则二者同时回滚，链上不可能出现
     “有链无快照”或“有快照无链”的半完成记录。
 
-    接链规则：链接编号严格小于自身的最近一条**现存**快照（回滚造成的
-    BIGSERIAL 空洞自动跳过）；该现存快照无链记录时 fail-closed 抛错，
-    绝不静默接创世摘要形成分叉。全库首条快照（无更早现存快照）使用固定
-    创世摘要，并把建链起点记为 anchor_kind：
+    存储形态（对外透明，读取时统一还原为完整冻结状态）：
+      - 整网导入 / 旧库基线 / 全库首条：写**全量**快照（state 列）；
+      - 其余小范围变更：若相对上一条现存快照的**增量载荷**比全量更小、
+        且连续增量深度未达 SNAPSHOT_DELTA_MAX_DEPTH，则只写**增量**快照
+        （base_snapshot_id + delta 列），新增持久化量随变化量而非管网
+        规模增长；否则回退全量（同时重置增量链深度）。
+
+    摘要链规则与存储形态无关：摘要始终按**还原后的完整冻结状态**计算。
+    链接编号严格小于自身的最近一条**现存**快照（回滚造成的 BIGSERIAL
+    空洞自动跳过）；该现存快照无链记录时 fail-closed 抛错，绝不静默接
+    创世摘要形成分叉。全库首条快照使用固定创世摘要，并记录建链起点：
       - live_origin：空库启用后的正常首条快照；
       - initial_backfill：旧库上线基线（与首次建链同批的现存快照）。
     """
-    with conn.cursor() as cur:
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         # 接链临界区串行化：正常写路径已持有 network_meta FOR UPDATE，
         # 咨询锁再兜底保证任何路径下并发写入都不会各自接上一条而分叉。
         cur.execute("SELECT pg_advisory_xact_lock(%s)", (CHAIN_LOCK_KEY,))
 
+        # 上一条现存快照（含存储形态与链摘要）。临界区内不存在并发插入，
+        # 因此编号最大者即“编号严格小于本条”的最近一条。
         cur.execute(
-            "INSERT INTO state_snapshots (op_type, network_version, event_id, state) "
-            "VALUES (%s, %s, %s, %s::jsonb) "
-            "RETURNING id, created_at",
-            (op_type, network_version, event_id, json.dumps(state)),
-        )
-        snapshot_id, created_at = cur.fetchone()
-
-        cur.execute(
-            "SELECT s.id, c.digest "
+            "SELECT s.id, s.state, s.base_snapshot_id, s.delta, c.digest "
             "FROM state_snapshots s "
             "LEFT JOIN state_snapshot_chains c ON c.snapshot_id = s.id "
-            "WHERE s.id < %s ORDER BY s.id DESC LIMIT 1",
-            (snapshot_id,),
+            "ORDER BY s.id DESC LIMIT 1"
         )
         prev_row = cur.fetchone()
+
+        # 存储形态决策：默认全量；小范围变更且增量更省、链不深时写增量。
+        base_snapshot_id: int | None = None
+        delta_payload: dict | None = None
+        if prev_row is not None and op_type not in _ALWAYS_FULL_OPS:
+            prev_state, prev_depth = _resolve_state_and_depth(conn, prev_row)
+            if prev_depth < SNAPSHOT_DELTA_MAX_DEPTH:
+                candidate = snapshot_state_delta(prev_state, state)
+                if _canonical_size(candidate) < _canonical_size(state):
+                    base_snapshot_id = prev_row["id"]
+                    delta_payload = candidate
+
+        if delta_payload is not None:
+            cur.execute(
+                "INSERT INTO state_snapshots "
+                "(op_type, network_version, event_id, base_snapshot_id, delta) "
+                "VALUES (%s, %s, %s, %s, %s::jsonb) "
+                "RETURNING id, created_at",
+                (
+                    op_type,
+                    network_version,
+                    event_id,
+                    base_snapshot_id,
+                    json.dumps(delta_payload),
+                ),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO state_snapshots (op_type, network_version, event_id, state) "
+                "VALUES (%s, %s, %s, %s::jsonb) "
+                "RETURNING id, created_at",
+                (op_type, network_version, event_id, json.dumps(state)),
+            )
+        inserted = cur.fetchone()
+        snapshot_id, created_at = inserted["id"], inserted["created_at"]
+
         if prev_row is None:
             prev_digest = audit.GENESIS_DIGEST
             kind = anchor_kind or audit.ANCHOR_LIVE_ORIGIN
-        elif prev_row[1] is None:
+        elif prev_row["digest"] is None:
             # 上一条现存快照未入链：启动建链缺失或链被外部破坏，拒绝写出分叉链
             raise RuntimeError(
-                f"快照 {prev_row[0]} 缺少摘要链记录，无法为快照 {snapshot_id} 接链"
+                f"快照 {prev_row['id']} 缺少摘要链记录，无法为快照 {snapshot_id} 接链"
             )
         else:
-            prev_digest = prev_row[1]
+            prev_digest = prev_row["digest"]
             kind = None  # 已有起点，非 anchor
 
+        # 摘要按完整冻结状态计算（state 为调用方冻结的完整状态，
+        # 与上面选择全量或增量存储无关）。
         digest = audit.snapshot_digest(
             snapshot_id=snapshot_id,
             op_type=op_type,
@@ -698,20 +875,23 @@ def insert_state_snapshot(
 
 
 def get_state_snapshot(conn, snapshot_id: int) -> dict | None:
-    """按编号读取冻结快照；不存在返回 None（路由层据此报 SNAPSHOT_NOT_FOUND）。"""
+    """按编号读取冻结快照（增量行已还原完整状态）；不存在返回 None。"""
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             f"SELECT {_SNAPSHOT_COLUMNS} FROM state_snapshots WHERE id = %s",
             (snapshot_id,),
         )
         row = cur.fetchone()
-    return _serialize_snapshot_row(row) if row else None
+    if row is None:
+        return None
+    _resolve_rows(conn, [row])
+    return _serialize_snapshot_row(row)
 
 
 def list_state_snapshots(
     conn, *, limit: int, after_id: int | None = None
 ) -> list[dict]:
-    """按编号升序列出快照元数据（含冻结状态）。
+    """按编号升序列出快照元数据（含还原后的完整冻结状态）。
 
     after_id 为游标：只返回编号严格大于它的快照；不传时从头返回。
     """
@@ -725,6 +905,7 @@ def list_state_snapshots(
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(sql, params)
         rows = cur.fetchall()
+    _resolve_rows(conn, rows)
     return [_serialize_snapshot_row(r) for r in rows]
 
 
@@ -737,7 +918,48 @@ def get_previous_state_snapshot(conn, snapshot_id: int) -> dict | None:
             (snapshot_id,),
         )
         row = cur.fetchone()
-    return _serialize_snapshot_row(row) if row else None
+    if row is None:
+        return None
+    _resolve_rows(conn, [row])
+    return _serialize_snapshot_row(row)
+
+
+def get_snapshot_storage(conn, snapshot_id: int) -> dict | None:
+    """读取快照的存储形态与持久化量（只读）；不存在返回 None。
+
+    storage=full：state 列即完整冻结状态，stored_bytes == state_bytes；
+    storage=delta：只持久化相对 base_snapshot_id 的净变化，
+    stored_bytes 为增量载荷字节数，state_bytes 为还原后完整状态字节数。
+    """
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(
+            f"SELECT {_SNAPSHOT_COLUMNS} FROM state_snapshots WHERE id = %s",
+            (snapshot_id,),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    if row["state"] is not None:
+        state = _decode_jsonb(row["state"])
+        return {
+            "id": row["id"],
+            "op_type": row["op_type"],
+            "storage": "full",
+            "base_snapshot_id": None,
+            "state_bytes": _canonical_size(state),
+            "stored_bytes": _canonical_size(state),
+            "created_at": row["created_at"],
+        }
+    state = _resolve_row_state(conn, row, {})
+    return {
+        "id": row["id"],
+        "op_type": row["op_type"],
+        "storage": "delta",
+        "base_snapshot_id": row["base_snapshot_id"],
+        "state_bytes": _canonical_size(state),
+        "stored_bytes": _canonical_size(_decode_jsonb(row["delta"])),
+        "created_at": row["created_at"],
+    }
 
 
 # ---------------------------------------------------------------- 快照摘要链
@@ -777,6 +999,8 @@ def anchor_snapshot_chain(conn) -> dict | None:
             f"SELECT {_SNAPSHOT_COLUMNS} FROM state_snapshots ORDER BY id ASC"
         )
         rows = cur.fetchall()
+        # 增量行先还原为完整冻结状态：摘要始终按完整状态计算，与存储形态无关
+        _resolve_rows(conn, rows)
 
         prev_digest = audit.GENESIS_DIGEST
         anchor_id = None
@@ -879,11 +1103,13 @@ def list_snapshot_chain_rows(conn, start_id: int, end_id: int) -> list[dict]:
     按编号升序；回滚造成的编号空洞自然不产生行（核验时不算断链）。
     LEFT JOIN 使缺少链记录的快照（被外部破坏）也能返回，由核验逻辑定位
     为链路断裂，而不是静默忽略。返回项含 stored_digest / stored_prev_digest。
+    增量行的 state 已沿基准链（可能延伸到区间起点之前）还原为完整冻结状态。
     """
     with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
         cur.execute(
             f"SELECT s.id, s.op_type, s.network_version, s.event_id, "
-            f"s.state, s.created_at, c.digest AS stored_digest, "
+            f"s.state, s.base_snapshot_id, s.delta, s.created_at, "
+            f"c.digest AS stored_digest, "
             f"c.prev_digest AS stored_prev_digest "
             f"FROM state_snapshots s "
             f"LEFT JOIN state_snapshot_chains c ON c.snapshot_id = s.id "
@@ -891,4 +1117,5 @@ def list_snapshot_chain_rows(conn, start_id: int, end_id: int) -> list[dict]:
             (start_id, end_id),
         )
         rows = cur.fetchall()
+    _resolve_rows(conn, rows)
     return [dict(r) for r in rows]

@@ -22,6 +22,7 @@
 - GET  /api/snapshots                                  快照列表（按编号升序，支持 after 游标）
 - GET  /api/snapshots/{snapshot_id}                    按编号读取冻结快照（节点/水源/阀位/待修复故障/供水点）
 - GET  /api/snapshots/{snapshot_id}/diff               与相邻上一条快照的六类净变化（可用 base_id 指定对照基线）
+- GET  /api/snapshots/{snapshot_id}/storage            快照存储形态与持久化量（全量/增量，只读）
 
 调度审计（快照摘要链）：
 - GET  /api/audit/chain                                摘要链信息（创世摘要、建链起点、现存/已入链快照范围）
@@ -89,6 +90,7 @@ from .schemas import (
     SnapshotOut,
     SnapshotMetaOut,
     SnapshotDiffOut,
+    SnapshotStorageOut,
     AuditVerifyIn,
     AuditVerifyOut,
     AuditChainInfoOut,
@@ -840,6 +842,25 @@ def diff_snapshot(
     # 只基于两份冻结载荷计算，绝不读取当前管网或后续事件回填
     diff = diff_states(base["state"] if base else None, target["state"])
     return serialize_snapshot_diff(base, target, diff)
+
+
+@app.get(
+    "/api/snapshots/{snapshot_id}/storage",
+    response_model=SnapshotStorageOut,
+    tags=["状态快照"],
+    summary="快照存储形态与持久化量：全量 / 增量（基准编号、还原后与实存字节数，只读）",
+)
+def get_snapshot_storage(snapshot_id: int):
+    # 与快照详情同一只读快照事务语义；存储形态不影响快照内容与摘要链
+    with db.read_transaction() as conn:
+        info = db.get_snapshot_storage(conn, snapshot_id)
+        if info is None:
+            raise ApiError(
+                404,
+                "SNAPSHOT_NOT_FOUND",
+                f"状态快照不存在：{snapshot_id}（快照编号不可复用，请核对编号后重试）",
+            )
+    return info
 
 
 # ---------------------------------------------------------------- 调度审计（快照摘要链）

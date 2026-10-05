@@ -2545,3 +2545,105 @@ def diff_states(base: dict | None, target: dict) -> dict:
         "open_faults": {"added": fault_added, "removed": fault_removed},
         "supplied_sinks": {"added": sink_added, "removed": sink_removed},
     }
+
+
+# ---------------------------------------------------------------- 快照增量存储
+
+
+# 增量（delta）快照载荷的格式版本标识：改动即构成新格式
+SNAPSHOT_DELTA_FORMAT = "water-snapshot-delta/v1"
+
+
+def snapshot_state_delta(prev_state: dict, new_state: dict) -> dict:
+    """计算 new_state 相对 prev_state 的增量载荷（纯函数，不依赖数据库）。
+
+    两份输入都必须是 freeze_state 产生的完整冻结状态（或由其还原的等价
+    状态）。载荷只记录净变化，因此小范围操作（关几个阀、切换水源）的
+    增量大小只随**变化量**增长，不随未变化的管网规模增长：
+
+    - nodes / pipes：编号集合的增删与字段变化（upserted 为变化后的完整
+      条目，removed_ids 为被移除编号）；
+    - open_faults：按事件编号的新增/移除；
+    - supplied_sink_ids：可达用水点集合的新增/移除。
+    """
+    prev_nodes, new_nodes = _node_index(prev_state), _node_index(new_state)
+    node_upserted = [
+        new_nodes[nid]
+        for nid in sorted(new_nodes)
+        if prev_nodes.get(nid) != new_nodes[nid]
+    ]
+    node_removed = sorted(set(prev_nodes) - set(new_nodes))
+
+    prev_pipes, new_pipes = _pipe_index(prev_state), _pipe_index(new_state)
+    pipe_upserted = [
+        new_pipes[pid]
+        for pid in sorted(new_pipes)
+        if prev_pipes.get(pid) != new_pipes[pid]
+    ]
+    pipe_removed = sorted(set(prev_pipes) - set(new_pipes))
+
+    prev_faults, new_faults = _fault_index(prev_state), _fault_index(new_state)
+    fault_added = [
+        new_faults[eid]
+        for eid in sorted(new_faults)
+        if prev_faults.get(eid) != new_faults[eid]
+    ]
+    fault_removed = sorted(set(prev_faults) - set(new_faults))
+
+    prev_sinks = set(prev_state.get("supplied_sink_ids", []))
+    new_sinks = set(new_state.get("supplied_sink_ids", []))
+
+    return {
+        "format": SNAPSHOT_DELTA_FORMAT,
+        "nodes": {"upserted": node_upserted, "removed_ids": node_removed},
+        "pipes": {"upserted": pipe_upserted, "removed_ids": pipe_removed},
+        "open_faults": {"added": fault_added, "removed_event_ids": fault_removed},
+        "supplied_sink_ids": {
+            "added": sorted(new_sinks - prev_sinks),
+            "removed": sorted(prev_sinks - new_sinks),
+        },
+    }
+
+
+def apply_snapshot_state_delta(base_state: dict, delta: dict) -> dict:
+    """把增量载荷套用到 base_state，还原完整冻结状态（纯函数）。
+
+    还原结果与 freeze_state 直接冻结的载荷**逐字节等价**（各数组按
+    编号/事件编号重新排序，与 freeze_state 的输出顺序一致），因此摘要链
+    可以继续按还原后的完整状态计算，与存储形态无关。
+    """
+    if not isinstance(delta, dict) or delta.get("format") != SNAPSHOT_DELTA_FORMAT:
+        raise ValueError(f"未知的快照增量格式：{delta.get('format') if isinstance(delta, dict) else type(delta).__name__}")
+
+    nodes = dict(_node_index(base_state))
+    node_delta = delta.get("nodes", {})
+    for nid in node_delta.get("removed_ids", []):
+        nodes.pop(nid, None)
+    for node in node_delta.get("upserted", []):
+        nodes[node["id"]] = node
+
+    pipes = dict(_pipe_index(base_state))
+    pipe_delta = delta.get("pipes", {})
+    for pid in pipe_delta.get("removed_ids", []):
+        pipes.pop(pid, None)
+    for pipe in pipe_delta.get("upserted", []):
+        pipes[pipe["id"]] = pipe
+
+    faults = dict(_fault_index(base_state))
+    fault_delta = delta.get("open_faults", {})
+    for event_id in fault_delta.get("removed_event_ids", []):
+        faults.pop(event_id, None)
+    for fault in fault_delta.get("added", []):
+        faults[fault["event_id"]] = fault
+
+    sinks = set(base_state.get("supplied_sink_ids", []))
+    sink_delta = delta.get("supplied_sink_ids", {})
+    sinks -= set(sink_delta.get("removed", []))
+    sinks |= set(sink_delta.get("added", []))
+
+    return {
+        "nodes": [nodes[nid] for nid in sorted(nodes)],
+        "pipes": [pipes[pid] for pid in sorted(pipes)],
+        "open_faults": [faults[eid] for eid in sorted(faults)],
+        "supplied_sink_ids": sorted(sinks),
+    }
